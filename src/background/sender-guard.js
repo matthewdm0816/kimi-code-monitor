@@ -3,7 +3,8 @@
  *
  * 能到达 onMessage 的发送者有三类：
  * - 扩展自有页面：popup（sender 无 tab）与选项页/其他扩展标签页（sender 带
- *   tab），URL 均为 chrome-extension://<自身 id>/ 前缀——全量放行；
+ *   tab），URL 为扩展自身源前缀（Chrome 为 chrome-extension://，Firefox 为
+ *   moz-extension://）——全量放行；
  * - 内容脚本：sender.url 是宿主页面 URL（http/https），仅「回环 + 已动态授权
  *   origin」的来源，且消息类型属于内容脚本实际使用的白名单；
  * - 网页/其他扩展：未配置 externally_connectable，到不了这里（防御性拒绝）。
@@ -33,9 +34,10 @@ const CONTENT_MESSAGE_TYPES = new Set([
 
 export async function authorizeMessage(type, sender) {
   const url = String(sender?.url || '');
-  // 扩展自有页面（popup / 选项页标签）：按自身扩展 ID 的 URL 前缀识别
-  const ownPrefix = `chrome-extension://${chrome.runtime.id}/`;
-  if (url.startsWith(ownPrefix)) return true;
+  // 扩展自有页面（popup / 选项页标签）：按自身扩展 URL 前缀识别
+  // （chrome.runtime.getURL 自动适配 Chrome / Firefox 的 scheme）
+  const ownPrefix = chrome.runtime.getURL('');
+  if (ownPrefix && url.startsWith(ownPrefix)) return true;
   // 其余无 tab 的发送者视为扩展上下文（防御性放行，正常路径不会出现）
   if (!sender?.tab) return true;
   // 内容脚本：来源必须是本机回环或已动态授权的站点，且消息类型在白名单内
