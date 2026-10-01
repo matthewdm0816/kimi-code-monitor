@@ -10,7 +10,7 @@
     }
   },
   "name": "Kimi Code Monitor",
-  "version": "3.5.2",
+  "version": "3.5.2.1",
   "author": "十叶",
   "description": "Kimi Code Web UI 底部 Agent 状态 HUD：额度、Token、缓存、性能一目了然",
   "icons": {

@@ -172,7 +172,7 @@ async function loadSessionSnapshot(targetSessionId, targetToken, requestId, sess
     // 快照带 usage：以服务器累计为准
     const snapshotUsage = data?.usage ? normalizeUsage(data.usage) : null;
     // 服务端对忙碌中的会话返回全零 usage/last_seq 的空壳快照（实测），
-    // 这种会话由本地按会话汇总恢复，服务器值不可信。
+    // 服务器值不可信——由 /snapshot 兜底或本地按会话汇总恢复（见下方分支）。
     const snapshotLooksUnavailable =
       snapshotUsage &&
       toNumber(data.last_seq) === 0 &&
@@ -198,19 +198,71 @@ async function loadSessionSnapshot(targetSessionId, targetToken, requestId, sess
       return;
     }
     metrics.agentStatus = data?.busy || data?.main_turn_active ? 'thinking' : 'idle';
-    // 空壳快照：内存缓存已由 startSession 恢复时不动数据；否则用本地汇总做底
+    // 空壳快照：内存缓存已由 startSession 恢复时不动数据；
+    // 否则先走 /snapshot 兜底（不依赖文件 API），仍不行才退回本地汇总
     if (sessionChanged && !hasLocalState) {
+      const fallback = await fetchSnapshotUsageFallback(targetSessionId, targetToken);
+      if (stale()) return;
+      if (fallback) {
+        applySnapshotUsageFallback(fallback);
+        return;
+      }
       await restoreSessionFromScan(targetSessionId, stale);
       return;
     }
     renderAll();
   } catch (error) {
-    console.warn('[Kimi Status] 会话快照拉取失败，改由本地按会话汇总恢复', error);
+    console.warn('[Kimi Status] 会话快照拉取失败，尝试 /snapshot 兜底恢复', error);
     if (!stale() && sessionChanged) {
-      if (hasLocalState) renderAll();
-      else await restoreSessionFromScan(targetSessionId, stale);
+      if (hasLocalState) {
+        renderAll();
+        return;
+      }
+      const fallback = await fetchSnapshotUsageFallback(targetSessionId, targetToken);
+      if (stale()) return;
+      if (fallback) {
+        applySnapshotUsageFallback(fallback);
+        return;
+      }
+      await restoreSessionFromScan(targetSessionId, stale);
     }
   }
+}
+
+// 空壳/失败时的兜底数据源：/snapshot 的 session.usage 在会话忙碌时仍是权威累计
+// （基座接口 /api/v1/sessions/{id} 此时返回全零空壳，实测）。这条路不依赖
+// 文件系统 API——Firefox 等没有 showDirectoryPicker 的环境里，本地按会话汇总
+// 永远为空，/snapshot 是恢复会话历史总量的唯一途径。
+// 返回 null 表示兜底也不可用（接口失败或同样全零），交给调用方继续降级。
+async function fetchSnapshotUsageFallback(targetSessionId, targetToken) {
+  try {
+    const response = await fetch(
+      `${rcApiPrefix()}/api/v1/sessions/${encodeURIComponent(targetSessionId)}/snapshot`,
+      { headers: localApiAuthHeaders(targetToken), signal: AbortSignal.timeout(15_000) }
+    );
+    if (!response.ok) return null;
+    const body = await response.json();
+    const data = body?.data && typeof body.data === 'object' ? body.data : body;
+    const sess = data?.session && typeof data.session === 'object' ? data.session : null;
+    const usage = sess?.usage ? normalizeUsage(sess.usage) : null;
+    if (!usage || (totalInputTokens(usage) === 0 && usage.outputTokens === 0)) return null;
+    return { usage, busy: !!(sess?.busy || sess?.main_turn_active) };
+  } catch {
+    return null;
+  }
+}
+
+// 应用兜底用量为面板底数。不动游标：空壳的 last_seq=0 本就无从推进，
+// 且历史重放只进折线样本不进计数，不会与这里的底数双算。
+function applySnapshotUsageFallback(fallback) {
+  metrics.inputTokens = fallback.usage.inputTokens;
+  metrics.outputTokens = fallback.usage.outputTokens;
+  metrics.cacheReadTokens = fallback.usage.cacheReadTokens;
+  metrics.cacheCreationTokens = fallback.usage.cacheCreationTokens;
+  metrics.agentStatus = fallback.busy ? 'thinking' : 'idle';
+  sessionSamples.length = 0;
+  turnDurations.length = 0;
+  renderAll();
 }
 
 // agent.status.updated：订阅后服务端会补推该会话最后一次 agent 状态，可能是滞留的
